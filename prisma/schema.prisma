@@ -1,0 +1,153 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// 日次バッチの実行履歴、設定、バージョンを保存
+// 制約: unique(target_date, board_key)
+model PipelineRun {
+  runId       String    @id @default(uuid()) @map("run_id")
+  targetDate  DateTime  @map("target_date") @db.Date
+  boardKey    String    @map("board_key")
+  status      String // 'success', 'failed', 'partial' - チェック制約あり
+  startedAt   DateTime  @default(now()) @map("started_at") @db.Timestamptz
+  finishedAt  DateTime? @map("finished_at") @db.Timestamptz
+  config      Json // 設定情報（Nスレ/最新レス数/レート制御など）
+  codeVersion String?   @map("code_version")
+  isRecovered Boolean   @default(false) @map("is_recovered")
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  // リレーション
+  pipelineMetrics PipelineMetricsDaily[]
+
+  @@unique([targetDate, boardKey])
+  @@map("pipeline_runs")
+}
+
+// 正規化後の名詞にIDを振った用語辞書
+// NG管理（is_blocked）、要確認フラグ（needs_review）を含む
+// 制約: unique(normalized)
+model Term {
+  termId          BigInt   @id @default(autoincrement()) @map("term_id")
+  normalized      String   @unique
+  needsReview     Boolean  @default(false) @map("needs_review")
+  isBlocked       Boolean  @default(false) @map("is_blocked")
+  blockedReason   String?  @map("blocked_reason")
+  surfaceExamples String[] @map("surface_examples")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // リレーション
+  dailyTermStats        DailyTermStat[]
+  weeklyTermTrends      WeeklyTermTrend[]
+  termRegressionResults TermRegressionResult[]
+
+  @@index([isBlocked])
+  @@index([needsReview])
+  @@map("terms")
+}
+
+// 日次×板×用語の集計結果（ダッシュボードの基本データ）
+// 主キー: (date, board_key, term_id)
+// チェック制約: post_hits >= 0, thread_hits >= 0
+model DailyTermStat {
+  date       DateTime @db.Date
+  boardKey   String   @map("board_key")
+  termId     BigInt   @map("term_id")
+  postHits   Int      @map("post_hits") // その語を含んだレス数（同一レス内で複数回出ても1カウント）
+  threadHits Int      @map("thread_hits") // その語を含んだスレ数（同一スレ内で複数レスに出ても1カウント）
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // リレーション
+  term Term @relation(fields: [termId], references: [termId], onDelete: Cascade)
+
+  @@id([date, boardKey, termId])
+  @@index([boardKey, date(sort: Desc)])
+  @@index([boardKey, termId, date])
+  @@map("daily_term_stats")
+}
+
+// 週次分析結果（急上昇スコア、出現率の信頼区間）
+// 主キー: (week_start_date, board_key, term_id)
+// week_start_date: その週の月曜日の日付
+// チェック制約: post_hits >= 0, total_posts >= 0, appearance_rate >= 0 and <= 1,
+//              appearance_rate_ci_lower >= 0 and <= 1, appearance_rate_ci_upper >= 0 and <= 1
+model WeeklyTermTrend {
+  weekStartDate         DateTime @map("week_start_date") @db.Date
+  boardKey              String   @map("board_key")
+  termId                BigInt   @map("term_id")
+  postHits              Int      @map("post_hits") // その週の出現レス数（週次集計値）
+  totalPosts            Int      @map("total_posts") // その週の総レス数（週次集計値）
+  appearanceRate        Float    @map("appearance_rate") // 出現率: post_hits / total_posts
+  appearanceRateCiLower Float?   @map("appearance_rate_ci_lower") // 登場率の信頼区間下限（Jeffreys区間）
+  appearanceRateCiUpper Float?   @map("appearance_rate_ci_upper") // 登場率の信頼区間上限（Jeffreys区間）
+  zscore                Float? // 急上昇スコア（z-score）
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // リレーション
+  term Term @relation(fields: [termId], references: [termId], onDelete: Cascade)
+
+  @@id([weekStartDate, boardKey, termId])
+  @@index([boardKey, weekStartDate, zscore(sort: Desc, nulls: Last)])
+  @@map("weekly_term_trends")
+}
+
+// 各名詞の時間トレンド（回帰分析結果）
+// 主キー: (board_key, term_id)
+// チェック制約: p_value >= 0 and <= 1
+model TermRegressionResult {
+  boardKey          String   @map("board_key")
+  termId            BigInt   @map("term_id")
+  intercept         Float // 回帰分析の切片 α
+  slope             Float // 回帰分析の傾き β
+  interceptCiLower  Float?   @map("intercept_ci_lower") // 切片の信頼区間下限
+  interceptCiUpper  Float?   @map("intercept_ci_upper") // 切片の信頼区間上限
+  slopeCiLower      Float?   @map("slope_ci_lower") // 傾きの信頼区間下限
+  slopeCiUpper      Float?   @map("slope_ci_upper") // 傾きの信頼区間上限
+  pValue            Float?   @map("p_value") // 傾きの検定のp値（β ≠ 0 の検定）
+  analysisStartDate DateTime @map("analysis_start_date") @db.Date // 分析に使用した期間の開始日
+  analysisEndDate   DateTime @map("analysis_end_date") @db.Date // 分析に使用した期間の終了日
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // リレーション
+  term Term @relation(fields: [termId], references: [termId], onDelete: Cascade)
+
+  @@id([boardKey, termId])
+  @@index([boardKey, slope(sort: Desc)])
+  @@map("term_regression_results")
+}
+
+// パイプラインの品質メトリクス（取得件数、解析失敗率、NG除外率など）
+// 主キー: (date, board_key)
+// チェック制約: fetched_threads >= 0, fetched_posts >= 0, parsed_posts >= 0,
+//              parse_fail_posts >= 0, tokenize_fail_posts >= 0, filtered_tokens >= 0,
+//              total_tokens >= 0, filtered_rate >= 0 and <= 1, duration_sec >= 0
+model PipelineMetricsDaily {
+  date              DateTime @db.Date
+  boardKey          String   @map("board_key")
+  runId             String?  @map("run_id")
+  fetchedThreads    Int      @map("fetched_threads")
+  fetchedPosts      Int      @map("fetched_posts")
+  parsedPosts       Int      @map("parsed_posts")
+  parseFailPosts    Int      @map("parse_fail_posts")
+  tokenizeFailPosts Int      @map("tokenize_fail_posts")
+  filteredTokens    Int      @map("filtered_tokens")
+  totalTokens       Int      @map("total_tokens")
+  filteredRate      Float    @map("filtered_rate") // filtered_tokens / total_tokens
+  durationSec       Int      @map("duration_sec")
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // リレーション
+  pipelineRun PipelineRun? @relation(fields: [runId], references: [runId], onDelete: SetNull)
+
+  @@id([date, boardKey])
+  @@index([boardKey, date])
+  @@map("pipeline_metrics_daily")
+}
